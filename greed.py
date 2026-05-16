@@ -1,11 +1,12 @@
 import sys
 import time
 import random
-from typing import List, Tuple, Optional
+from collections import deque
+from typing import List, Tuple, Optional, Dict
 
-# Constants mapped to game rules
+# Game Constants
 GRID_SIZE = 32
-TIME_LIMIT_SEC = 0.40  # 400ms cutoff ensures we never hit the 500ms timeout
+TIME_LIMIT_SEC = 0.40  # 400ms to guarantee we avoid the 500ms execution timeout
 MOVES = [
     ("u", 0, -1),
     ("d", 0, 1),
@@ -13,41 +14,167 @@ MOVES = [
     ("r", 1, 0),
 ]
 
-# 1D arrays for maximum memory locality and fast copy/undo operations
+# 1D arrays for maximum cache locality and execution speed.
 original_grid = [0] * (GRID_SIZE * GRID_SIZE)
 claimed_grid = bytearray(GRID_SIZE * GRID_SIZE)
 
-def get_move_outcome(x: int, y: int, dx: int, dy: int) -> Optional[Tuple[int, int, List[Tuple[int, int]]]]:
-    """
-    Simulates the full D-step trajectory of a given move.
-    Returns the final coordinates and a list of cells traversed, or None if the move is lethal.
-    """
+def get_jump_distance(x: int, y: int, dx: int, dy: int) -> int:
+    """Calculates the jump distance based on the adjacent cell's value."""
     adj_x, adj_y = x + dx, y + dy
-    
-    # "If the adjacent cell is outside the grid, the movement distance is 1."
     if not (0 <= adj_x < GRID_SIZE and 0 <= adj_y < GRID_SIZE):
-        dist = 1
-    else:
-        dist = original_grid[adj_y * GRID_SIZE + adj_x]
+        return 1
+    return original_grid[adj_y * GRID_SIZE + adj_x]
 
-    cells = []
+def simulate_move(x: int, y: int, dx: int, dy: int, current_claimed: bytearray) -> Optional[Tuple[int, int, List[int]]]:
+    """
+    Simulates a move without mutating global state.
+    Returns (new_x, new_y, list_of_1d_indices_claimed) or None if lethal.
+    """
+    dist = get_jump_distance(x, y, dx, dy)
+    
+    indices = []
     curr_x, curr_y = x, y
     
     for _ in range(dist):
         curr_x += dx
         curr_y += dy
         
-        # Out of bounds check
+        # OOB Check
         if not (0 <= curr_x < GRID_SIZE and 0 <= curr_y < GRID_SIZE):
             return None
             
-        # Collision with claimed cell check
-        if claimed_grid[curr_y * GRID_SIZE + curr_x]:
+        idx = curr_y * GRID_SIZE + curr_x
+        # Collision Check
+        if current_claimed[idx]:
             return None
             
-        cells.append((curr_x, curr_y))
+        indices.append(idx)
         
-    return curr_x, curr_y, cells
+    return curr_x, curr_y, indices
+
+def fast_bfs_territory(start_x: int, start_y: int, current_claimed: bytearray) -> int:
+    """
+    Calculates an approximation of reachable space (Voronoi region volume).
+    Uses a standard BFS queue but simulates the line-drawing jump mechanics.
+    """
+    visited = bytearray(GRID_SIZE * GRID_SIZE)
+    start_idx = start_y * GRID_SIZE + start_x
+    visited[start_idx] = 1
+    
+    queue = deque([(start_x, start_y)])
+    volume = 0
+    
+    while queue:
+        cx, cy = queue.popleft()
+        
+        for _, dx, dy in MOVES:
+            outcome = simulate_move(cx, cy, dx, dy, current_claimed)
+            if outcome:
+                nx, ny, path_indices = outcome
+                n_idx = ny * GRID_SIZE + nx
+                
+                if not visited[n_idx]:
+                    visited[n_idx] = 1
+                    # Add the volume of the space we just jumped through
+                    volume += len(path_indices)
+                    queue.append((nx, ny))
+                    
+    return volume
+
+def evaluate_state(my_x: int, my_y: int, enemy_x: int, enemy_y: int, current_claimed: bytearray) -> float:
+    """
+    Evaluates the board state. 
+    Positive score = We control more territory.
+    Negative score = Opponent controls more territory.
+    """
+    my_reach = fast_bfs_territory(my_x, my_y, current_claimed)
+    enemy_reach = fast_bfs_territory(enemy_x, enemy_y, current_claimed)
+    
+    # If the enemy is completely trapped (0 reach), assign infinite score.
+    if enemy_reach == 0 and my_reach > 0:
+        return 1000000.0
+    
+    return float(my_reach - enemy_reach)
+
+def get_best_move(my_x: int, my_y: int, enemy_x: int, enemy_y: int) -> str:
+    """
+    Uses Game Theory (Maximin) on a depth-1 simultaneous payoff matrix.
+    """
+    start_time = time.time()
+    
+    # Pre-calculate valid immediate moves to prune tree
+    my_valid_moves = []
+    for move_id, dx, dy in MOVES:
+        out = simulate_move(my_x, my_y, dx, dy, claimed_grid)
+        if out: my_valid_moves.append((move_id, dx, dy, out))
+        
+    enemy_valid_moves = []
+    for move_id, dx, dy in MOVES:
+        out = simulate_move(enemy_x, enemy_y, dx, dy, claimed_grid)
+        if out: enemy_valid_moves.append((move_id, dx, dy, out))
+
+    # Tactical failure handling
+    if not my_valid_moves:
+        return "u" # We are dead no matter what.
+
+    if not enemy_valid_moves:
+        # Enemy is dead, just pick our longest immediate jump to farm points safely.
+        my_valid_moves.sort(key=lambda m: len(m[3][2]), reverse=True)
+        return my_valid_moves[0][0]
+
+    best_move = my_valid_moves[0][0]
+    best_maximin_score = -float('inf')
+
+    # Construct the Payoff Matrix
+    for my_move_id, my_dx, my_dy, my_out in my_valid_moves:
+        my_nx, my_ny, my_indices = my_out
+        
+        worst_case_response_score = float('inf')
+        
+        for e_move_id, e_dx, e_dy, e_out in enemy_valid_moves:
+            e_nx, e_ny, e_indices = e_out
+            
+            # Rule: "If both players enter the same cell during the same movement step, both die"
+            # We calculate step-by-step collision.
+            step_collision = False
+            min_steps = min(len(my_indices), len(e_indices))
+            for i in range(min_steps):
+                if my_indices[i] == e_indices[i]:
+                    step_collision = True
+                    break
+            
+            # Cross-path collision (one player crosses a line the other just drew)
+            # Apply temporary state mutation
+            temp_claimed = bytearray(claimed_grid)
+            for idx in my_indices: temp_claimed[idx] = 1
+            for idx in e_indices: temp_claimed[idx] = 1
+            
+            if step_collision:
+                # Both die. We only want this if we are losing terribly, otherwise avoid.
+                score = -500000.0
+            else:
+                # Check if we landed on a cell the enemy just claimed (or vice versa)
+                if my_ny * GRID_SIZE + my_nx in e_indices:
+                    score = -1000000.0 # We die
+                elif e_ny * GRID_SIZE + e_nx in my_indices:
+                    score = 1000000.0  # Enemy dies
+                else:
+                    # Both survived this turn, evaluate territory
+                    # Time check to prevent timeouts mid-matrix
+                    if time.time() - start_time > TIME_LIMIT_SEC:
+                        break 
+                    score = evaluate_state(my_nx, my_ny, e_nx, e_ny, temp_claimed)
+            
+            # The opponent wants to minimize our score.
+            if score < worst_case_response_score:
+                worst_case_response_score = score
+                
+        # We want to maximize our score in the worst-case scenario.
+        if worst_case_response_score > best_maximin_score:
+            best_maximin_score = worst_case_response_score
+            best_move = my_move_id
+
+    return best_move
 
 def fill_line(x1: int, y1: int, x2: int, y2: int) -> None:
     """Updates the claimed_grid based on a player's movement line."""
@@ -58,144 +185,39 @@ def fill_line(x1: int, y1: int, x2: int, y2: int) -> None:
         for x in range(min(x1, x2), max(x1, x2) + 1):
             claimed_grid[y1 * GRID_SIZE + x] = 1
 
-def dfs(x: int, y: int, current_depth: int, max_depth: int, current_score: int, start_time: float) -> int:
-    """
-    Recursive depth-first search to evaluate path viability.
-    Scoring hierarchy: Survival Depth > Score > Open Space
-    """
-    if time.time() - start_time > TIME_LIMIT_SEC:
-        raise TimeoutError()
-
-    if current_depth == max_depth:
-        # Leaf node evaluation: Count immediate open paths to favor wide-open spaces over corridors
-        valid_count = sum(1 for _, dx, dy in MOVES if get_move_outcome(x, y, dx, dy) is not None)
-        return (current_depth * 1000000) + (current_score * 1000) + valid_count
-
-    max_score = -float('inf')
-    moved = False
-
-    for _, dx, dy in MOVES:
-        outcome = get_move_outcome(x, y, dx, dy)
-        if outcome:
-            nx, ny, cells = outcome
-            moved = True
-            
-            # Apply state mutation
-            for cx, cy in cells:
-                claimed_grid[cy * GRID_SIZE + cx] = 1
-
-            # Recurse deeper
-            score = dfs(nx, ny, current_depth + 1, max_depth, current_score + len(cells), start_time)
-            if score > max_score:
-                max_score = score
-
-            # Revert state mutation (Backtrack)
-            for cx, cy in cells:
-                claimed_grid[cy * GRID_SIZE + cx] = 0
-
-    if not moved:
-        # Path results in death at `current_depth`
-        return (current_depth * 1000000) + (current_score * 1000)
-
-    return int(max_score)
-
-def get_best_move(my_x: int, my_y: int, enemy_x: int, enemy_y: int) -> str:
-    start_time = time.time()
-    
-    valid_moves = []
-    for move_id, dx, dy in MOVES:
-        outcome = get_move_outcome(my_x, my_y, dx, dy)
-        if outcome:
-            valid_moves.append((move_id, dx, dy, outcome))
-
-    if not valid_moves:
-        return "u" # Inevitable death; send arbitrary valid format
-
-    # If only one move prevents immediate death, take it without burning CPU time
-    if len(valid_moves) == 1:
-        return valid_moves[0][0]
-
-    # Calculate opponent's immediate danger zones to avoid head-to-head collisions
-    enemy_danger_zones = set()
-    for _, dx, dy in MOVES:
-        e_outcome = get_move_outcome(enemy_x, enemy_y, dx, dy)
-        if e_outcome:
-            _, _, e_cells = e_outcome
-            for cx, cy in e_cells:
-                enemy_danger_zones.add((cx, cy))
-
-    best_overall_move = valid_moves[0][0]
-    
-    try:
-        # Iterative Deepening: Search deeper until timeout
-        for max_depth in range(1, 50): 
-            best_depth_move = None
-            best_depth_score = -float('inf')
-
-            # Shuffle to prevent deterministic looping behavior in symmetrical maps
-            random.shuffle(valid_moves)
-
-            for move_id, dx, dy, outcome in valid_moves:
-                nx, ny, cells = outcome
-
-                # Check if this move intercepts a space the opponent can claim this turn
-                is_dangerous = any((cx, cy) in enemy_danger_zones for cx, cy in cells)
-                danger_penalty = 5000000 if is_dangerous else 0
-
-                # Apply
-                for cx, cy in cells:
-                    claimed_grid[cy * GRID_SIZE + cx] = 1
-
-                move_score = dfs(nx, ny, 1, max_depth, len(cells), start_time) - danger_penalty
-
-                # Undo
-                for cx, cy in cells:
-                    claimed_grid[cy * GRID_SIZE + cx] = 0
-
-                if move_score > best_depth_score:
-                    best_depth_score = move_score
-                    best_depth_move = move_id
-
-            best_overall_move = best_depth_move
-
-    except TimeoutError:
-        # Time limit reached, fallback to the best move found in the fully completed previous depth layer
-        pass
-
-    return best_overall_move
-
 def main():
-    # Initialize Game State (Round 0)
-    grid_digits = input().strip().replace(" ", "")
-    for i in range(GRID_SIZE * GRID_SIZE):
-        original_grid[i] = int(grid_digits[i])
+    try:
+        grid_digits = input().strip().replace(" ", "")
+        for i in range(GRID_SIZE * GRID_SIZE):
+            original_grid[i] = int(grid_digits[i])
 
-    my_pos = None
-    enemy_pos = None
+        my_pos = None
+        enemy_pos = None
 
-    for round_i in range(999999):
-        # Input: my_x my_y opponent_x opponent_y
-        received_positions = [int(n) for n in input().strip().split()]
-        my_x, my_y = received_positions[0:2]
-        enemy_x, enemy_y = received_positions[2:4]
+        # Game Loop
+        for round_i in range(999999):
+            received_positions = [int(n) for n in input().strip().split()]
+            my_x, my_y = received_positions[0:2]
+            enemy_x, enemy_y = received_positions[2:4]
 
-        # Register Starting Setup
-        if my_pos is None or enemy_pos is None:
-            claimed_grid[my_y * GRID_SIZE + my_x] = 1
-            claimed_grid[enemy_y * GRID_SIZE + enemy_x] = 1
-        else:
-            # Update dynamic grid state with recent lines drawn by both players
-            fill_line(my_pos[0], my_pos[1], my_x, my_y)
-            fill_line(enemy_pos[0], enemy_pos[1], enemy_x, enemy_y)
+            if my_pos is None or enemy_pos is None:
+                claimed_grid[my_y * GRID_SIZE + my_x] = 1
+                claimed_grid[enemy_y * GRID_SIZE + enemy_x] = 1
+            else:
+                fill_line(my_pos[0], my_pos[1], my_x, my_y)
+                fill_line(enemy_pos[0], enemy_pos[1], enemy_x, enemy_y)
 
-        my_pos = (my_x, my_y)
-        enemy_pos = (enemy_x, enemy_y)
+            my_pos = (my_x, my_y)
+            enemy_pos = (enemy_x, enemy_y)
 
-        # Compute and dispatch optimal move
-        move = get_best_move(my_x, my_y, enemy_x, enemy_y)
-        
-        print(move)
-        sys.stdout.flush() 
+            move = get_best_move(my_x, my_y, enemy_x, enemy_y)
+            
+            print(move)
+            sys.stdout.flush() 
+            
+    except EOFError:
+        # Graceful exit when the engine stops sending inputs (Game Over)
+        pass
 
 if __name__ == "__main__":
     main()
