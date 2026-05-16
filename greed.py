@@ -2,11 +2,11 @@ import sys
 import time
 import random
 from collections import deque
-from typing import List, Tuple, Optional, Dict
+from typing import List, Tuple, Optional
 
-# Game Constants
+# --- Game Constants ---
 GRID_SIZE = 32
-TIME_LIMIT_SEC = 0.40  # 400ms to guarantee we avoid the 500ms execution timeout
+TIME_LIMIT_SEC = 0.40  # 400ms cutoff ensures we never hit 500ms
 MOVES = [
     ("u", 0, -1),
     ("d", 0, 1),
@@ -14,170 +14,167 @@ MOVES = [
     ("r", 1, 0),
 ]
 
-# 1D arrays for maximum cache locality and execution speed.
-original_grid = [0] * (GRID_SIZE * GRID_SIZE)
+# --- Global State ---
+original_grid = [1] * (GRID_SIZE * GRID_SIZE)
 claimed_grid = bytearray(GRID_SIZE * GRID_SIZE)
 
 def get_jump_distance(x: int, y: int, dx: int, dy: int) -> int:
-    """Calculates the jump distance based on the adjacent cell's value."""
-    adj_x, adj_y = x + dx, y + dy
-    if not (0 <= adj_x < GRID_SIZE and 0 <= adj_y < GRID_SIZE):
+    """Retrieves jump distance strictly adhering to game rules."""
+    nx, ny = x + dx, y + dy
+    if not (0 <= nx < GRID_SIZE and 0 <= ny < GRID_SIZE):
         return 1
-    return original_grid[adj_y * GRID_SIZE + adj_x]
+    return original_grid[ny * GRID_SIZE + nx]
 
-def simulate_move(x: int, y: int, dx: int, dy: int, current_claimed: bytearray) -> Optional[Tuple[int, int, List[int]]]:
+def simulate_jump(x: int, y: int, dx: int, dy: int, state: bytearray) -> Optional[Tuple[int, int, List[int]]]:
     """
-    Simulates a move without mutating global state.
-    Returns (new_x, new_y, list_of_1d_indices_claimed) or None if lethal.
+    Simulates jump physics cleanly.
+    Returns (final_x, final_y, list_of_claimed_1d_indices) or None if lethal.
     """
     dist = get_jump_distance(x, y, dx, dy)
-    
-    indices = []
-    curr_x, curr_y = x, y
+    path = []
+    cx, cy = x, y
     
     for _ in range(dist):
-        curr_x += dx
-        curr_y += dy
+        cx += dx
+        cy += dy
         
-        # OOB Check
-        if not (0 <= curr_x < GRID_SIZE and 0 <= curr_y < GRID_SIZE):
-            return None
+        if not (0 <= cx < GRID_SIZE and 0 <= cy < GRID_SIZE):
+            return None  # Wall
             
-        idx = curr_y * GRID_SIZE + curr_x
-        # Collision Check
-        if current_claimed[idx]:
-            return None
+        idx = cy * GRID_SIZE + cx
+        if state[idx]:
+            return None  # Claimed cell
             
-        indices.append(idx)
+        path.append(idx)
         
-    return curr_x, curr_y, indices
+    return cx, cy, path
 
-def fast_bfs_territory(start_x: int, start_y: int, current_claimed: bytearray) -> int:
+def calculate_jump_voronoi(my_x: int, my_y: int, en_x: int, en_y: int, current_state: bytearray) -> float:
     """
-    Calculates an approximation of reachable space (Voronoi region volume).
-    Uses a standard BFS queue but simulates the line-drawing jump mechanics.
+    Dual-BFS to calculate reachable territory using exact jump mechanics.
+    Returns: (My Territory Volume) - (Enemy Territory Volume)
     """
-    visited = bytearray(GRID_SIZE * GRID_SIZE)
-    start_idx = start_y * GRID_SIZE + start_x
-    visited[start_idx] = 1
+    my_q = deque([(my_x, my_y)])
+    en_q = deque([(en_x, en_y)])
     
-    queue = deque([(start_x, start_y)])
-    volume = 0
+    visited = bytearray(current_state)
+    visited[my_y * GRID_SIZE + my_x] = 1
+    visited[en_y * GRID_SIZE + en_x] = 1
     
-    while queue:
-        cx, cy = queue.popleft()
-        
-        for _, dx, dy in MOVES:
-            outcome = simulate_move(cx, cy, dx, dy, current_claimed)
-            if outcome:
-                nx, ny, path_indices = outcome
-                n_idx = ny * GRID_SIZE + nx
-                
-                if not visited[n_idx]:
-                    visited[n_idx] = 1
-                    # Add the volume of the space we just jumped through
-                    volume += len(path_indices)
-                    queue.append((nx, ny))
+    my_score = 0
+    en_score = 0
+    
+    # Expand level by level to approximate fair simultaneous reach
+    while my_q or en_q:
+        # My Expansion
+        for _ in range(len(my_q)):
+            cx, cy = my_q.popleft()
+            for _, dx, dy in MOVES:
+                sim = simulate_jump(cx, cy, dx, dy, visited)
+                if sim:
+                    nx, ny, path = sim
+                    for idx in path: visited[idx] = 1
+                    my_score += len(path)
+                    my_q.append((nx, ny))
                     
-    return volume
+        # Enemy Expansion
+        for _ in range(len(en_q)):
+            cx, cy = en_q.popleft()
+            for _, dx, dy in MOVES:
+                sim = simulate_jump(cx, cy, dx, dy, visited)
+                if sim:
+                    nx, ny, path = sim
+                    for idx in path: visited[idx] = 1
+                    en_score += len(path)
+                    en_q.append((nx, ny))
 
-def evaluate_state(my_x: int, my_y: int, enemy_x: int, enemy_y: int, current_claimed: bytearray) -> float:
-    """
-    Evaluates the board state. 
-    Positive score = We control more territory.
-    Negative score = Opponent controls more territory.
-    """
-    my_reach = fast_bfs_territory(my_x, my_y, current_claimed)
-    enemy_reach = fast_bfs_territory(enemy_x, enemy_y, current_claimed)
-    
-    # If the enemy is completely trapped (0 reach), assign infinite score.
-    if enemy_reach == 0 and my_reach > 0:
-        return 1000000.0
-    
-    return float(my_reach - enemy_reach)
+    # If the enemy has 0 reach but we have space, heavily reward this state
+    if en_score == 0 and my_score > 0:
+        return 10000.0 + my_score
+        
+    return float(my_score - en_score)
 
-def get_best_move(my_x: int, my_y: int, enemy_x: int, enemy_y: int) -> str:
-    """
-    Uses Game Theory (Maximin) on a depth-1 simultaneous payoff matrix.
-    """
+def get_best_move(my_x: int, my_y: int, en_x: int, en_y: int, en_dead: bool) -> str:
+    """Uses a Maximin Matrix to handle simultaneous evaluation."""
     start_time = time.time()
     
-    # Pre-calculate valid immediate moves to prune tree
-    my_valid_moves = []
+    my_moves = []
     for move_id, dx, dy in MOVES:
-        out = simulate_move(my_x, my_y, dx, dy, claimed_grid)
-        if out: my_valid_moves.append((move_id, dx, dy, out))
+        sim = simulate_jump(my_x, my_y, dx, dy, claimed_grid)
+        if sim: my_moves.append((move_id, dx, dy, sim))
         
-    enemy_valid_moves = []
-    for move_id, dx, dy in MOVES:
-        out = simulate_move(enemy_x, enemy_y, dx, dy, claimed_grid)
-        if out: enemy_valid_moves.append((move_id, dx, dy, out))
+    en_moves = []
+    if not en_dead:
+        for move_id, dx, dy in MOVES:
+            sim = simulate_jump(en_x, en_y, dx, dy, claimed_grid)
+            if sim: en_moves.append((move_id, dx, dy, sim))
 
-    # Tactical failure handling
-    if not my_valid_moves:
-        return "u" # We are dead no matter what.
+    if not my_moves: return "u"  # Inevitable death
+    if len(my_moves) == 1 and en_dead: return my_moves[0][0]
+    
+    # If enemy is dead, maximize immediate safe volume 
+    # (Voronoi vs nothing = maximize our score)
+    if en_dead or not en_moves:
+        my_moves.sort(key=lambda m: len(m[3][2]), reverse=True)
+        return my_moves[0][0]
 
-    if not enemy_valid_moves:
-        # Enemy is dead, just pick our longest immediate jump to farm points safely.
-        my_valid_moves.sort(key=lambda m: len(m[3][2]), reverse=True)
-        return my_valid_moves[0][0]
+    best_move = my_moves[0][0]
+    best_worst_case_score = -float('inf')
 
-    best_move = my_valid_moves[0][0]
-    best_maximin_score = -float('inf')
-
-    # Construct the Payoff Matrix
-    for my_move_id, my_dx, my_dy, my_out in my_valid_moves:
-        my_nx, my_ny, my_indices = my_out
-        
+    # Construct Simultaneous Matrix
+    random.shuffle(my_moves) # Prevent deterministic looping
+    
+    for my_id, _, _, (my_nx, my_ny, my_path) in my_moves:
         worst_case_response_score = float('inf')
         
-        for e_move_id, e_dx, e_dy, e_out in enemy_valid_moves:
-            e_nx, e_ny, e_indices = e_out
+        for en_id, _, _, (en_nx, en_ny, en_path) in en_moves:
             
-            # Rule: "If both players enter the same cell during the same movement step, both die"
-            # We calculate step-by-step collision.
+            # 1. Check for Simultaneous Step Collision (Both die)
             step_collision = False
-            min_steps = min(len(my_indices), len(e_indices))
+            min_steps = min(len(my_path), len(en_path))
             for i in range(min_steps):
-                if my_indices[i] == e_indices[i]:
+                if my_path[i] == en_path[i]:
                     step_collision = True
                     break
+                    
+            # 2. Check for Cross-Path Collision
+            # Did I land on a line they just drew, or vice versa?
+            my_final_idx = my_ny * GRID_SIZE + my_nx
+            en_final_idx = en_ny * GRID_SIZE + en_nx
             
-            # Cross-path collision (one player crosses a line the other just drew)
-            # Apply temporary state mutation
-            temp_claimed = bytearray(claimed_grid)
-            for idx in my_indices: temp_claimed[idx] = 1
-            for idx in e_indices: temp_claimed[idx] = 1
+            i_die = my_final_idx in en_path
+            they_die = en_final_idx in my_path
             
             if step_collision:
-                # Both die. We only want this if we are losing terribly, otherwise avoid.
-                score = -500000.0
+                score = -50000.0  # Avoid mutual destruction unless losing
+            elif i_die and they_die:
+                score = -50000.0
+            elif i_die:
+                score = -100000.0
+            elif they_die:
+                score = 100000.0
             else:
-                # Check if we landed on a cell the enemy just claimed (or vice versa)
-                if my_ny * GRID_SIZE + my_nx in e_indices:
-                    score = -1000000.0 # We die
-                elif e_ny * GRID_SIZE + e_nx in my_indices:
-                    score = 1000000.0  # Enemy dies
-                else:
-                    # Both survived this turn, evaluate territory
-                    # Time check to prevent timeouts mid-matrix
-                    if time.time() - start_time > TIME_LIMIT_SEC:
-                        break 
-                    score = evaluate_state(my_nx, my_ny, e_nx, e_ny, temp_claimed)
-            
-            # The opponent wants to minimize our score.
+                # Both survived this ply. Apply state and run Voronoi.
+                temp_state = bytearray(claimed_grid)
+                for idx in my_path: temp_state[idx] = 1
+                for idx in en_path: temp_state[idx] = 1
+                
+                # Time safety check
+                if time.time() - start_time > TIME_LIMIT_SEC:
+                    break
+                    
+                score = calculate_jump_voronoi(my_nx, my_ny, en_nx, en_ny, temp_state)
+                
             if score < worst_case_response_score:
                 worst_case_response_score = score
                 
-        # We want to maximize our score in the worst-case scenario.
-        if worst_case_response_score > best_maximin_score:
-            best_maximin_score = worst_case_response_score
-            best_move = my_move_id
+        if worst_case_response_score > best_worst_case_score:
+            best_worst_case_score = worst_case_response_score
+            best_move = my_id
 
     return best_move
 
 def fill_line(x1: int, y1: int, x2: int, y2: int) -> None:
-    """Updates the claimed_grid based on a player's movement line."""
     if x1 == x2:
         for y in range(min(y1, y2), max(y1, y2) + 1):
             claimed_grid[y * GRID_SIZE + x1] = 1
@@ -192,31 +189,35 @@ def main():
             original_grid[i] = int(grid_digits[i])
 
         my_pos = None
-        enemy_pos = None
+        en_pos = None
+        en_dead = False
 
-        # Game Loop
-        for round_i in range(999999):
-            received_positions = [int(n) for n in input().strip().split()]
-            my_x, my_y = received_positions[0:2]
-            enemy_x, enemy_y = received_positions[2:4]
+        while True:
+            line = input().strip()
+            if not line: continue
+            
+            positions = [int(n) for n in line.split()]
+            my_x, my_y = positions[0:2]
+            en_x, en_y = positions[2:4]
 
-            if my_pos is None or enemy_pos is None:
+            if my_pos is None:
                 claimed_grid[my_y * GRID_SIZE + my_x] = 1
-                claimed_grid[enemy_y * GRID_SIZE + enemy_x] = 1
+                claimed_grid[en_y * GRID_SIZE + en_x] = 1
             else:
+                if en_pos == (en_x, en_y):
+                    en_dead = True
                 fill_line(my_pos[0], my_pos[1], my_x, my_y)
-                fill_line(enemy_pos[0], enemy_pos[1], enemy_x, enemy_y)
+                fill_line(en_pos[0], en_pos[1], en_x, en_y)
 
             my_pos = (my_x, my_y)
-            enemy_pos = (enemy_x, enemy_y)
+            en_pos = (en_x, en_y)
 
-            move = get_best_move(my_x, my_y, enemy_x, enemy_y)
+            move = get_best_move(my_x, my_y, en_x, en_y, en_dead)
             
             print(move)
-            sys.stdout.flush() 
+            sys.stdout.flush()
             
     except EOFError:
-        # Graceful exit when the engine stops sending inputs (Game Over)
         pass
 
 if __name__ == "__main__":
