@@ -1,245 +1,326 @@
+#!/usr/bin/env python3
+import os
 import sys
 import random
-from collections import deque
-from typing import List, Dict, Tuple, Set, Optional
+import heapq
+import traceback
+from typing import Dict, List, Tuple, Set, Optional, Callable, Any
 
-# Constants
-BOARD_SIZE = 29
-MAX_HYDRATION = 140
-MOVES = [
-    ("u", 0, -1),
-    ("d", 0, 1),
-    ("l", -1, 0),
-    ("r", 1, 0),
-    ("s", 0, 0),
-]
+# =============================================================================
+# CONSTANTS & TYPES
+# =============================================================================
+N = 29
+DIRS: Dict[str, Tuple[int, int]] = {
+    "u": (0, -1),
+    "d": (0, 1),
+    "l": (-1, 0),
+    "r": (1, 0),
+    "s": (0, 0),
+}
+MOVE_ORDER = ["u", "d", "l", "r"]
 
-def get_territory(x: int, y: int) -> str:
-    """
-    Determines the territory type of a given cell.
-    Oasis overrides standard territory boundaries.
-    """
-    if 12 <= x <= 16 and 12 <= y <= 16:
-        return "neutral"
-    if y <= 13:
-        return "blue"
-    if y >= 15:
-        return "red"
-    return "neutral"
+Position = Tuple[int, int]
+Player = Dict[str, Any]  # Keys: 'x', 'y', 'h', 'flag'
 
-def find_path(
-    start_x: int,
-    start_y: int,
-    start_hyd: int,
-    targets: Set[Tuple[int, int]],
-    enemies: List[Dict[str, int]],
-    obstacles: Set[Tuple[int, int]],
-    our_team: str,
-    enemy_team: str
-) -> Tuple[Optional[str], float]:
-    """
-    Executes a hydration-aware layer-by-layer BFS to find the shortest
-    safe path to any target cell within the target set.
-    """
-    if (start_x, start_y) in targets:
-        return "s", 0.0
+# =============================================================================
+# GLOBAL STATE
+# =============================================================================
+board: str = "." * (N * N)
+is_initialized: bool = False
+home_top: bool = False
+own_flag_initial: Position = (0, 0)
+enemy_flag_initial: Position = (28, 28)
+enemy_flag_pos: Position = (28, 28)
 
-    # Queue stores: (x, y, current_hydration, path_taken)
-    queue = deque([(start_x, start_y, start_hyd, [])])
+assigned_role: Optional[str] = None
+prev_own: Optional[Player] = None
+prev_mate: Optional[Player] = None
+
+
+# =============================================================================
+# UTILITY FUNCTIONS
+# =============================================================================
+def output(move: str) -> None:
+    print(move if move in DIRS else "s", flush=True)
+
+def parse_state(line: str) -> Tuple[Player, Player, List[Player]]:
+    vals = list(map(int, line.split()))
+    players = [
+        {"x": vals[i], "y": vals[i + 1], "h": vals[i + 2], "flag": vals[i + 3] == 1}
+        for i in range(0, 16, 4)
+    ]
+    return players[0], players[1], [players[2], players[3]]
+
+def alive(p: Player) -> bool:
+    return p["x"] >= 0 and p["y"] >= 0
+
+def pos(p: Player) -> Position:
+    return (p["x"], p["y"])
+
+def in_bounds(x: int, y: int) -> bool:
+    return 0 <= x < N and 0 <= y < N
+
+def open_cell(p: Position) -> bool:
+    x, y = p
+    return in_bounds(x, y) and board[y * N + x] != "#"
+
+def step_from(p: Position, move: str) -> Position:
+    x, y = p
+    dx, dy = DIRS[move]
+    nx, ny = x + dx, y + dy
+    return (nx, ny) if open_cell((nx, ny)) else p
+
+def is_oasis(p: Position) -> bool:
+    x, y = p
+    return 12 <= x <= 16 and 12 <= y <= 16
+
+def own_territory(p: Position) -> bool:
+    if not open_cell(p) or is_oasis(p):
+        return False
+    return p[1] <= 13 if home_top else p[1] >= 15
+
+def enemy_territory(p: Position) -> bool:
+    if not open_cell(p) or is_oasis(p):
+        return False
+    return p[1] >= 15 if home_top else p[1] <= 13
+
+def cheb(a: Position, b: Position) -> int:
+    return max(abs(a[0] - b[0]), abs(a[1] - b[1]))
+
+def manhattan(a: Position, b: Position) -> int:
+    return abs(a[0] - b[0]) + abs(a[1] - b[1])
+
+def get_cells_matching(pred: Callable[[Position], bool]) -> Set[Position]:
+    return {(x, y) for y in range(N) for x in range(N) if open_cell((x, y)) and pred((x, y))}
+
+# =============================================================================
+# CORE ARCHITECTURE: WEIGHTED PATHFINDING (Dijkstra)
+# =============================================================================
+def path_move(start: Position, goals: Set[Position], enemies: List[Player], avoid_danger: bool) -> str:
+    """
+    Industry-standard Dijkstra implementation. 
+    Never aborts early based on cost; guarantees shortest path finding even through heavy danger.
+    """
+    if start in goals:
+        return "s"
+    if not goals:
+        return "s"
+
+    # Danger mapping: O(E)
+    danger_zones: Set[Position] = set()
+    if avoid_danger:
+        for e in enemies:
+            if alive(e):
+                ep = pos(e)
+                for dy in range(-2, 3):
+                    for dx in range(-2, 3):
+                        dp = (ep[0] + dx, ep[1] + dy)
+                        if enemy_territory(dp):
+                            danger_zones.add(dp)
+
+    pq: List[Tuple[int, Position, str]] = []
+    seen: Dict[Position, int] = {start: 0}
+
+    for move in MOVE_ORDER:
+        nxt = step_from(start, move)
+        if nxt == start:
+            continue
+        
+        cost = 1000 if nxt in danger_zones else 1
+        seen[nxt] = cost
+        heapq.heappush(pq, (cost, nxt, move))
+
+    best_move = "s"
     
-    # Tracks the maximum hydration seen at a specific cell to optimize state space
-    best_hyd: Dict[Tuple[int, int], int] = {(start_x, start_y): start_hyd}
+    while pq:
+        cost, cur, first_move = heapq.heappop(pq)
 
-    while queue:
-        x, y, hyd, path = queue.popleft()
+        if cur in goals:
+            return first_move
 
-        if (x, y) in targets:
-            return path[0] if path else "s", float(len(path))
+        # No premature cost-break here. Let Dijkstra fully exhaust the 841-node graph.
 
-        for move, dx, dy in MOVES:
-            nx, ny = x + dx, y + dy
-
-            # Out of bounds or structural obstacle
-            if not (0 <= nx < BOARD_SIZE and 0 <= ny < BOARD_SIZE):
-                continue
-            if (nx, ny) in obstacles:
+        for move in MOVE_ORDER:
+            nxt = step_from(cur, move)
+            if nxt == cur:
                 continue
 
-            # Combat Threat Mapping: Avoid enemy proximity death zones in enemy territory
-            if get_territory(nx, ny) == enemy_team:
-                unsafe = False
-                for e in enemies:
-                    if e["x"] != -1:  # Enemy is alive
-                        if max(abs(nx - e["x"]), abs(ny - e["y"])) <= 1:
-                            unsafe = True
-                            break
-                if unsafe:
-                    continue
+            step_cost = 1000 if nxt in danger_zones else 1
+            new_cost = cost + step_cost
 
-            # Hydration Cost Evaluation
-            cost = 2 if get_territory(nx, ny) == our_team else 1
-            nhyd = hyd - cost
-            if nhyd <= 0:
-                continue
+            if nxt not in seen or new_cost < seen[nxt]:
+                seen[nxt] = new_cost
+                heapq.heappush(pq, (new_cost, nxt, first_move))
 
-            # Oasis Refill Mechanic
-            if 12 <= nx <= 16 and 12 <= ny <= 16:
-                nhyd = MAX_HYDRATION
+    return fallback_greedy_move(start, goals, danger_zones)
 
-            # State Pruning
-            if nhyd > best_hyd.get((nx, ny), -1):
-                best_hyd[(nx, ny)] = nhyd
-                queue.append((nx, ny, nhyd, path + [move]))
-
-    return None, float("inf")
-
-def main():
-    # Initial Setup Phase
-    try:
-        board_text = input().strip()
-    except Exception:
-        return
-
-    obstacles: Set[Tuple[int, int]] = {
-        (index % BOARD_SIZE, index // BOARD_SIZE)
-        for index, cell in enumerate(board_text)
-        if cell == "#"
-    }
-
-    # Global State Configuration determined dynamically on Round 0
-    our_team = ""
-    enemy_team = ""
-    enemy_flag: Tuple[int, int] = (0, 0)
-    home_territory_cells: Set[Tuple[int, int]] = set()
-    oasis_cells: Set[Tuple[int, int]] = {
-        (x, y) for x in range(12, 17) for y in range(12, 17)
-    }
-
-    # Precompute home territory layouts once configuration is locked
-    initialized_config = False
-
-    while True:
-        try:
-            line = input()
-            if not line:
-                break
-            values = [int(n) for n in line.split()]
-        except Exception:
-            break
-
-        players = [
-            {
-                "x": values[i],
-                "y": values[i + 1],
-                "hydration": values[i + 2],
-                "has_flag": values[i + 3],
-            }
-            for i in range(0, 16, 4)
-        ]
-
-        me = players[0]
-        teammate = players[1]
-        enemies = [players[2], players[3]]
-
-        # Dead players bypass calculation
-        if me["x"] == -1 or me["y"] == -1:
-            print("s", flush=True)
+def fallback_greedy_move(start: Position, goals: Set[Position], danger_zones: Set[Position]) -> str:
+    best_move, best_score = "s", -float('inf')
+    
+    for move in ["u", "d", "l", "r", "s"]:
+        nxt = step_from(start, move)
+        if move != "s" and nxt == start:
             continue
 
-        # Dynamic Configuration Discovery
-        if not initialized_config:
-            if me["x"] == 0 and me["y"] == 0:
-                our_team = "blue"
-                enemy_team = "red"
-                enemy_flag = (28, 28)
-            else:
-                our_team = "red"
-                enemy_team = "blue"
-                enemy_flag = (0, 0)
+        dist = min((manhattan(nxt, g) for g in goals), default=0)
+        score = -dist
 
-            for tx in range(BOARD_SIZE):
-                for ty in range(BOARD_SIZE):
-                    if get_territory(tx, ty) == our_team:
-                        home_territory_cells.add((tx, ty))
-            initialized_config = True
+        if nxt in danger_zones:
+            score -= 1000
+        if move == "s":
+            score -= 0.1
 
-        # Symmetry Breaking Rule Engine
-        if (me["x"], me["y"]) == (teammate["x"], teammate["y"]):
-            # If stacked at spawn or elsewhere, use random exploration to split coordinates
-            safe_moves = []
-            for move, dx, dy in MOVES:
-                nx, ny = me["x"] + dx, me["y"] + dy
-                if 0 <= nx < BOARD_SIZE and 0 <= ny < BOARD_SIZE and (nx, ny) not in obstacles:
-                    safe_moves.append(move)
-            print(random.choice(safe_moves or ["s"]), flush=True)
-            continue
+        if score > best_score:
+            best_score = score
+            best_move = move
 
-        # Target Set Definition Based on Game State Context
-        targets: Set[Tuple[int, int]] = set()
+    return best_move
 
-        if me["has_flag"] == 1:
-            # Objective: Return the flag to home territory immediately
-            targets = home_territory_cells
-        elif any(e["has_flag"] == 1 for e in enemies):
-            # Objective: Intercept the specific enemy carrier
-            carrier = next(e for e in enemies if e["has_flag"] == 1)
-            targets.add((carrier["x"], carrier["y"]))
-            # Include adjacent tracking positions if carrier is outside their home base
-            if get_territory(carrier["x"], carrier["y"]) != enemy_team:
-                for _, dx, dy in MOVES:
-                    nx, ny = carrier["x"] + dx, carrier["y"] + dy
-                    if 0 <= nx < BOARD_SIZE and 0 <= ny < BOARD_SIZE:
-                        targets.add((nx, ny))
+# =============================================================================
+# STRATEGY LOGIC
+# =============================================================================
+def chase_invader_move(own: Player, enemies: List[Player]) -> Optional[str]:
+    invaders = [e for e in enemies if alive(e) and own_territory(pos(e))]
+    if not invaders:
+        return None
+
+    def priority(e: Player) -> Tuple[int, int, int]:
+        flag_score = 0 if e["flag"] else 1
+        escape_score = (13 - e["y"]) if home_top else (e["y"] - 15)
+        return (flag_score, escape_score, manhattan(pos(own), pos(e)))
+
+    target = min(invaders, key=priority)
+    targets = {pos(target)}
+    
+    for move in (["d", "r", "l"] if home_top else ["u", "r", "l"]):
+        p = step_from(pos(target), move)
+        if open_cell(p):
+            targets.add(p)
+
+    return path_move(pos(own), targets, enemies, avoid_danger=False)
+
+def defender_move(own: Player, mate: Player, enemies: List[Player]) -> str:
+    p = pos(own)
+    chase = chase_invader_move(own, enemies)
+    if chase:
+        return chase
+
+    oasis_goals = get_cells_matching(is_oasis)
+    if own["h"] < 75 and oasis_goals and not is_oasis(p):
+        return path_move(p, oasis_goals, enemies, avoid_danger=False)
+
+    fx, fy = own_flag_initial
+    guard_cells = { (x, y) for y in range(max(0, fy-2), min(N, fy+3)) 
+                           for x in range(max(0, fx-2), min(N, fx+3)) 
+                           if open_cell((x, y)) and (x, y) != (fx, fy) }
+                           
+    return path_move(p, guard_cells, enemies, avoid_danger=False)
+
+def attacker_move(own: Player, mate: Player, enemies: List[Player]) -> str:
+    p = pos(own)
+    
+    if own["flag"]:
+        home_goals = get_cells_matching(own_territory)
+        return path_move(p, home_goals, enemies, avoid_danger=True)
+
+    if mate["flag"] or any(alive(e) and e["flag"] and own_territory(pos(e)) for e in enemies):
+        return defender_move(own, mate, enemies)
+
+    if not is_oasis(p):
+        should_go_oasis = own["h"] < 90 or (home_top and p[1] < 12) or (not home_top and p[1] > 16)
+        if should_go_oasis:
+            oasis_goals = get_cells_matching(is_oasis)
+            if oasis_goals:
+                return path_move(p, oasis_goals, enemies, avoid_danger=True)
+
+    return path_move(p, {enemy_flag_pos}, enemies, avoid_danger=True)
+
+def decide(own: Player, mate: Player, enemies: List[Player]) -> str:
+    global is_initialized, home_top, own_flag_initial, enemy_flag_initial, enemy_flag_pos, assigned_role
+
+    if not alive(own):
+        return "s"
+
+    # Strictly execute setup only once to guarantee orientation consistency.
+    if not is_initialized:
+        if own["y"] <= 14:
+            home_top = True
+            own_flag_initial = (0, 0)
+            enemy_flag_initial = (28, 28)
+            enemy_flag_pos = (28, 28)
         else:
-            # Role Evaluation Strategy: Attacker vs Defender
-            _, dist_me = find_path(me["x"], me["y"], me["hydration"], {enemy_flag}, enemies, obstacles, our_team, enemy_team)
-            _, dist_team = find_path(teammate["x"], teammate["y"], teammate["hydration"], {enemy_flag}, enemies, obstacles, our_team, enemy_team)
+            home_top = False
+            own_flag_initial = (28, 28)
+            enemy_flag_initial = (0, 0)
+            enemy_flag_pos = (0, 0)
+        is_initialized = True
 
-            is_attacker = False
-            if dist_me < dist_team:
-                is_attacker = True
-            elif dist_me == dist_team:
-                # Deterministic Tie-Breaker
-                if me["x"] != teammate["x"]:
-                    is_attacker = me["x"] < teammate["x"]
-                else:
-                    is_attacker = me["y"] < teammate["y"]
+    if not alive(mate):
+        assigned_role = 'attacker'
+    
+    if assigned_role is None:
+        if pos(own) == pos(mate):
+            # Fallback random divergence for literal identical inputs
+            valid_moves = [m for m in MOVE_ORDER if step_from(pos(own), m) != pos(own)]
+            return random.choice(valid_moves) if valid_moves else "s"
+        else:
+            assigned_role = 'attacker' if pos(own) > pos(mate) else 'defender'
 
-            if is_attacker:
-                targets.add(enemy_flag)
-            else:
-                # Defender Role: Neutralize threats invading home territory
-                invaders = [e for e in enemies if e["x"] != -1 and get_territory(e["x"], e["y"]) == our_team]
-                if invaders:
-                    # Target the closest invader's structural proximity cell
-                    for invader in invaders:
-                        for _, dx, dy in MOVES:
-                            nx, ny = invader["x"] + dx, invader["y"] + dy
-                            if 0 <= nx < BOARD_SIZE and 0 <= ny < BOARD_SIZE:
-                                targets.add((nx, ny))
-                else:
-                    # Default defensive position: Patrol near the Oasis gateway
-                    targets.add(enemy_flag)
+    if own["flag"]:
+        return attacker_move(own, mate, enemies)
+    if mate["flag"]:
+        return defender_move(own, mate, enemies)
+        
+    return attacker_move(own, mate, enemies) if assigned_role == 'attacker' else defender_move(own, mate, enemies)
 
-        # Route Calculation
-        move, path_len = find_path(me["x"], me["y"], me["hydration"], targets, enemies, obstacles, our_team, enemy_team)
 
-        # Hydration Mitigation Fallback
-        if move is None:
-            move, _ = find_path(me["x"], me["y"], me["hydration"], oasis_cells, enemies, obstacles, our_team, enemy_team)
+# =============================================================================
+# MAIN LOOP
+# =============================================================================
+def main() -> None:
+    global board, prev_own, prev_mate, enemy_flag_pos
+    
+    # Process-unique seeding guarantees different pathing choices during overlap
+    random.seed(os.getpid())
 
-        # Emergency Fail-safe Strategy
-        if move is None:
-            # If trapped or completely starved out, choose any viable move that doesn't trigger death
-            for fallback_move, dx, dy in MOVES:
-                nx, ny = me["x"] + dx, me["y"] + dy
-                if 0 <= nx < BOARD_SIZE and 0 <= ny < BOARD_SIZE and (nx, ny) not in obstacles:
-                    move = fallback_move
-                    break
-            else:
-                move = "s"
+    first = sys.stdin.readline()
+    if not first:
+        return
+    first = first.rstrip("\n")
 
-        print(move, flush=True)
+    if len(first) >= N * N and all(c in ".#" for c in first[:N * N]):
+        board = first[:N * N]
+        state_line = sys.stdin.readline()
+    else:
+        state_line = first
+
+    while state_line:
+        try:
+            state_line = state_line.strip()
+            if not state_line:
+                output("s")
+                state_line = sys.stdin.readline()
+                continue
+
+            own, mate, enemies = parse_state(state_line)
+            
+            if not own["flag"] and not mate["flag"]:
+                for old_p in [prev_own, prev_mate]:
+                    if old_p and old_p["flag"] and alive(old_p):
+                        old_pos = pos(old_p)
+                        caught = any(alive(e) and enemy_territory(old_pos) and cheb(old_pos, pos(e)) <= 1 for e in enemies)
+                        enemy_flag_pos = enemy_flag_initial if caught else old_pos
+            
+            move = decide(own, mate, enemies)
+            output(move)
+
+            prev_own, prev_mate = own.copy(), mate.copy()
+
+        except Exception:
+            traceback.print_exc(file=sys.stderr)
+            output("s")
+
+        state_line = sys.stdin.readline()
 
 if __name__ == "__main__":
     main()
